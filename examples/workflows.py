@@ -141,10 +141,67 @@ def run(flow):
                 exported = db.transfer.export_lines("segments")
                 db.catalog.create("copy_segments", SCHEMA)
                 imported = db.transfer.import_lines("copy_segments", exported["lines"])
-                output = {"revision": exported["revision"], "imported": imported.__dict__,
-                          "duplicate": rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)}
+                duplicate = rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)
                 if len(db.query("copy_segments").records) != 6:
                     raise RuntimeError("logical import differs")
+                db.catalog.create("links")
+                seeded = db.batch("share_seed").put(
+                    "segments", "seg_00", {"region": "north", "sequence": 20, "code": "c0",
+                                           "contact": {"email": "ada@example.com", "phone": "+1-555-0100"}},
+                    expected=first).put(
+                    "links", "link_00", {"segment": "seg_00", "email": "ada@example.com"}).commit()
+                sharing = db.transfer.export_redacted(
+                    ["segments", "links"],
+                    {"segments": {"delete": ["contact.phone"],
+                                  "replace": [{"path": "contact.email", "group": "email"}]},
+                     "links": {"replace": [{"path": "email", "group": "email"},
+                                           {"path": "segment", "group": "default"}]}},
+                    revision=seeded.revision, key="transfer-example-secret")
+                repeated = db.transfer.export_redacted(
+                    ["segments", "links"],
+                    {"segments": {"delete": ["contact.phone"],
+                                  "replace": [{"path": "contact.email", "group": "email"}]},
+                     "links": {"replace": [{"path": "email", "group": "email"},
+                                           {"path": "segment", "group": "default"}]}},
+                    revision=seeded.revision, key="transfer-example-secret")
+                manifest = sharing["manifest"]
+                lines = sharing["collections"]["segments"]["lines"] + sharing["collections"]["links"]["lines"]
+                serialized = json.dumps(sharing)
+                redacted_documents = [json.loads(line)["document"] for line in sharing["collections"]["segments"]["lines"]]
+                link_documents = [json.loads(line)["document"] for line in sharing["collections"]["links"]["lines"]]
+                segment_keys = [json.loads(line)["key"] for line in sharing["collections"]["segments"]["lines"]]
+                owner = next(page for page in redacted_documents if "contact" in page)
+                db.catalog.create("shared_copy", SCHEMA)
+                db.catalog.create("shared_links")
+                db.transfer.import_lines("shared_copy", sharing["collections"]["segments"]["lines"])
+                db.transfer.import_lines("shared_links", sharing["collections"]["links"]["lines"])
+                output = {
+                    "revision": exported["revision"], "imported": imported.__dict__, "duplicate": duplicate,
+                    "redacted": {
+                        "revision": sharing["revision"],
+                        "key_fingerprint": sharing["key_fingerprint"],
+                        "verification": db.transfer.verify_redacted(sharing),
+                        "manifest_revision_matches": manifest["revision"] == seeded.revision,
+                        "stable_across_exports": sharing["collections"] == repeated["collections"],
+                        "originals_absent": all(secret not in serialized for secret in
+                                                ("ada@example.com", "+1-555-0100")),
+                        "contact_keys": sorted(owner["contact"]),
+                        "email_token_linked": link_documents[0]["email"] == owner["contact"]["email"],
+                        "key_token_linked": link_documents[0]["segment"] in segment_keys,
+                        "removed_by_rule": manifest["collections"]["segments"]["coverage"],
+                        "reimported": len(db.query("shared_copy").records) + len(db.query("shared_links").records),
+                    },
+                    "rule_rejections": {
+                        "overlap": rejected(lambda: db.transfer.export_redacted(
+                            "segments", {"delete": ["contact"], "replace": ["contact.email"]}, key="k"), InvalidDocument),
+                        "object_replacement": rejected(lambda: db.transfer.export_redacted(
+                            "segments", {"replace": ["contact"]}, key="k"), InvalidDocument),
+                        "missing_rules": rejected(lambda: db.transfer.export_redacted(
+                            ["segments", "links"], {"segments": {"keep": ["region"]}}, key="k"), InvalidDocument),
+                    },
+                }
+                if not all(secret not in json.dumps(manifest) for secret in ("ada@example.com", "+1-555-0100")):
+                    raise RuntimeError("redacted manifest leaked a source value")
             else:
                 raise ValueError("unknown example workflow: " + flow)
             print(json.dumps({"workflow": flow, "result": output}, ensure_ascii=False, sort_keys=True, default=str))
